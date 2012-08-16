@@ -217,14 +217,14 @@ class Controller < Sinatra::Base
     content_type 'application/json'
     cross_origin
     story = []
-    page_bins = pages_by_timespan
+    sorted_changes = changes_sorted_by_timespan
 
     TIMESPANS.each do |timespan|
-      next if page_bins[timespan].empty?
+      next if sorted_changes[timespan].empty?
       story << recent_change_header(timespan)
-      page_bins[timespan].each do |page|
+      story += sorted_changes[timespan].collect do |page|
         next if page['story'].empty?
-        story << recent_change_story(page)
+        recent_change_story(page)
       end
     end
 
@@ -232,14 +232,15 @@ class Controller < Sinatra::Base
     JSON.pretty_generate(page)
   end
 
-  def pages_by_timespan
+  def changes_sorted_by_timespan
     pages = Store.annotated_pages farm_page.directory
-    page_bins = Hash.new {|hash, key| hash[key] = Array.new}
+    sorted_changes = Hash.new {|hash, key| hash[key] = Array.new}
+
     pages.each do |page|
       last_updated = Time.now - page['updated_at']
-      page_bins[timespan_since(last_updated)] << page
+      sorted_changes[timespan_since(last_updated)] << page
     end
-    page_bins
+    sorted_changes
   end
 
   def recent_change_story(page)
