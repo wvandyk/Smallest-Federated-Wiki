@@ -32,6 +32,20 @@ class Controller < Sinatra::Base
   end
   helpers ServerHelpers
 
+  REMOTE_SITE_JSON_PAGE = %r{^/remote/([a-zA-Z0-9:\.-]+)/([a-z0-9-]+)\.json$}
+  REMOTE_SITE_FAVICON = %r{^/remote/([a-zA-Z0-9:\.-]+)/favicon.png$}
+
+  PAGE_NAME = %r{^/([a-z0-9-]+)\.json$}
+
+  HTTP_OK = 200
+  HTTP_BAD_REQUEST = 400
+  HTTP_UNAUTHORIZED = 401
+  HTTP_FORBIDDEN = 403
+  HTTP_NOT_FOUND = 404
+  HTTP_CONFLICT = 409
+  HTTP_NOT_IMPLEMENTED = 501
+  TIMESPANS = ['Minute', 'Hour', 'Day', 'Week', 'Month', 'Season', 'Year']
+
   Store.set ENV['STORE_TYPE'], APP_ROOT
 
   class << self # overridden in test
@@ -87,11 +101,11 @@ class Controller < Sinatra::Base
     response = openid_consumer.complete(params, request.url)
     case response.status
       when OpenID::Consumer::FAILURE
-        oops 401, "Login failure"
+        oops HTTP_UNAUTHORIZED, "Login failure"
       when OpenID::Consumer::SETUP_NEEDED
-        oops 400, "Setup needed"
+        oops HTTP_BAD_REQUEST, "Setup needed"
       when OpenID::Consumer::CANCEL
-        oops 400, "Login cancelled"
+        oops HTTP_BAD_REQUEST, "Login cancelled"
       when OpenID::Consumer::SUCCESS
         id = params['openid.identity']
         id_file = File.join farm_status, "open_id.identity"
@@ -101,7 +115,7 @@ class Controller < Sinatra::Base
             # login successful
             authenticate!
           else
-            oops 403, "This is not your wiki"
+            oops HTTP_FORBIDDEN, "This is not your wiki"
           end
         else
           Store.put_text id_file, id
@@ -125,7 +139,7 @@ class Controller < Sinatra::Base
 
   get '/random.png' do
     unless authenticated? or (!identified? and !claimed?)
-      halt 403
+      halt HTTP_FORBIDDEN
       return
     end
 
@@ -158,12 +172,12 @@ class Controller < Sinatra::Base
       end
       datasets.length > 0
     end
-    halt 404 unless candidates.length > 0
+    halt HTTP_NOT_FOUND unless candidates.length > 0
     JSON.pretty_generate(candidates.first)
   end
 
   get %r{^/([a-z0-9-]+)\.html$} do |name|
-    halt 404 unless farm_page.exists?(name)
+    halt HTTP_NOT_FOUND unless farm_page.exists?(name)
     haml :page, :locals => { :page => farm_page.get(name), :page_name => name }
   end
 
@@ -202,76 +216,64 @@ class Controller < Sinatra::Base
   get '/recent-changes.json' do
     content_type 'application/json'
     cross_origin
-    bins = Hash.new {|hash, key| hash[key] = Array.new}
-
-    pages = Store.annotated_pages farm_page.directory
-    pages.each do |page|
-      dt = Time.now - page['updated_at']
-      bins[(dt/=60)<1?'Minute':(dt/=60)<1?'Hour':(dt/=24)<1?'Day':(dt/=7)<1?'Week':(dt/=4)<1?'Month':(dt/=3)<1?'Season':(dt/=4)<1?'Year':'Forever'] << page
-    end
-
     story = []
-    ['Minute', 'Hour', 'Day', 'Week', 'Month', 'Season', 'Year'].each do |key|
-      next unless bins[key].length>0
-      story << {'type' => 'paragraph', 'text' => "<h3>Within a #{key}</h3>", 'id' => RandomId.generate}
-      bins[key].each do |page|
+    page_bins = pages_by_timespan
+
+    TIMESPANS.each do |timespan|
+      next if page_bins[timespan].empty?
+      story << recent_change_header(timespan)
+      page_bins[timespan].each do |page|
         next if page['story'].empty?
-        site = "#{request.host}#{request.port==80 ? '' : ':'+request.port.to_s}"
-        story << {'type' => 'federatedWiki', 'site' => site, 'slug' => page['name'], 'title' => page['title'], 'text' => "", 'id' => RandomId.generate}
+        story << recent_change_story(page)
       end
     end
+
     page = {'title' => 'Recent Changes', 'story' => story}
     JSON.pretty_generate(page)
   end
 
-  # get '/global-changes.json' do
-  #   content_type 'application/json'
-  #   cross_origin
-  #   bins = Hash.new {|hash, key| hash[key] = Array.new}
-  #   Dir.chdir(File.join(self.class.data_root, "farm")) do
-  #     Dir.glob("*") do |site|
-  #       Dir.chdir(File.join(site,'pages')) do
-  #         count = 100
-  #         Dir.glob("*").collect do |slug|
-  #           dt = Time.now - File.new(slug).mtime
-  #           break if (count -= 1) <= 0
-  #           slug = "#{site}/#{slug}"
-  #           bins[(dt/=60)<1?'Minute':(dt/=60)<1?'Hour':(dt/=24)<1?'Day':(dt/=7)<1?'Week':(dt/=4)<1?'Month':(dt/=3)<1?'Season':(dt/=4)<1?'Year':'Forever']<<slug
-  #         end
-  #       end
-  #     end
-  #   end
-  #   story = []
-  #   ['Minute', 'Hour', 'Day', 'Week'].each do |key|
-  #     next unless bins[key].length>0
-  #     story << {'type' => 'paragraph', 'text' => "<h3>Within a #{key}</h3>", 'id' => RandomId.generate}
-  #     bins[key].each do |remote|
-  #       (site,slug) = remote.split '/'
-  #       farm = Page.new
-  #       farm.directory = File.join(self.class.data_root, "farm/#{site}")
-  #       farm.default_directory = File.join APP_ROOT, "default-data", "pages"
-  #       page = farm.get(slug)
-  #       next if page['story'].length == 0
-  #       site = "#{site}#{request.port==80 ? '' : ':'+request.port.to_s}"
-  #       story << {'type' => 'federatedWiki', 'site' => site, 'slug' => slug, 'title' => page['title'], 'text' => "", 'id' => RandomId.generate}
-  #     end
-  #   end
-  #   page = {'title' => 'Recent Changes', 'story' => story}
-  #   JSON.pretty_generate(page)
-  # end
+  def pages_by_timespan
+    pages = Store.annotated_pages farm_page.directory
+    page_bins = Hash.new {|hash, key| hash[key] = Array.new}
+    pages.each do |page|
+      last_updated = Time.now - page['updated_at']
+      page_bins[timespan_since(last_updated)] << page
+    end
+    page_bins
+  end
 
-  get %r{^/([a-z0-9-]+)\.json$} do |name|
+  def recent_change_story(page)
+    {'type' => 'federatedWiki', 'site' => site_string, 'slug' => page['name'], 'title' => page['title'], 'text' => "", 'id' => RandomId.generate}
+  end
+
+  def recent_change_header(timespan)
+    {'type' => 'paragraph', 'text' => "<h3>Within a #{timespan}</h3>", 'id' => RandomId.generate}
+  end
+
+  def site_string
+    "#{request.host}#{port_string}"
+  end
+
+  def port_string
+    "#{request.port==80 ? '' : ':'+request.port.to_s}"
+  end
+
+  def timespan_since(dt)
+    (dt/=60)<1?'Minute':(dt/=60)<1?'Hour':(dt/=24)<1?'Day':(dt/=7)<1?'Week':(dt/=4)<1?'Month':(dt/=3)<1?'Season':(dt/=4)<1?'Year':'Forever'
+  end
+
+  get PAGE_NAME do |name|
     content_type 'application/json'
     serve_page name
   end
 
-  error 403 do
+  error HTTP_FORBIDDEN do
     'Access forbidden'
   end
 
   put %r{^/page/([a-z0-9-]+)/action$} do |name|
     unless authenticated? or (!identified? and !claimed?)
-      halt 403
+      halt HTTP_FORBIDDEN
       return
     end
 
@@ -283,7 +285,7 @@ class Controller < Sinatra::Base
       farm_page.put name, page
       action.delete 'fork'
     elsif action['type'] == 'create'
-      return halt 409 if farm_page.exists?(name)
+      return halt HTTP_CONFLICT if farm_page.exists?(name)
       page = action['item'].clone
     elsif action['type'] == 'fork'
       page = JSON.parse RestClient.get("#{action['site']}/#{name}.json")
@@ -305,7 +307,7 @@ class Controller < Sinatra::Base
       page['story'] ||= []
     else
       puts "unfamiliar action: #{action.inspect}"
-      status 501
+      status HTTP_NOT_IMPLEMENTED
       return "unfamiliar action"
     end
     ( page['journal'] ||= [] ) << action # todo: journal undo, not redo
@@ -313,7 +315,7 @@ class Controller < Sinatra::Base
     "ok"
   end
 
-  get %r{^/remote/([a-zA-Z0-9:\.-]+)/([a-z0-9-]+)\.json$} do |site, name|
+  get REMOTE_SITE_JSON_PAGE do |site, name|
     content_type 'application/json'
     host = site.split(':').first
     if serve_resources_locally?(host)
@@ -321,10 +323,10 @@ class Controller < Sinatra::Base
     else
       RestClient.get "#{site}/#{name}.json" do |response, request, result, &block|
         case response.code
-        when 200
+        when HTTP_OK
           response
-        when 404
-          halt 404
+        when HTTP_NOT_FOUND
+          halt HTTP_NOT_FOUND
         else
           response.return!(request, result, &block)
         end
@@ -332,7 +334,8 @@ class Controller < Sinatra::Base
     end
   end
 
-  get %r{^/remote/([a-zA-Z0-9:\.-]+)/favicon.png$} do |site|
+
+  get REMOTE_SITE_FAVICON do |site|
     content_type 'image/png'
     host = site.split(':').first
     if serve_resources_locally?(host)
@@ -343,7 +346,7 @@ class Controller < Sinatra::Base
   end
 
   not_found do
-    oops 404, "Page not found"
+    oops HTTP_NOT_FOUND, "Page not found"
   end
 
   put '/submit' do
